@@ -117,9 +117,13 @@ fmha_dense_fwd_kernel_sm89(
 
     const bf16 *q_row = q + (size_t)token * num_qo_heads * HEAD_DIM_QK + (size_t)head * HEAD_DIM_QK;
     __shared__ float smem[NUM_WARPS];
+    // The row max is reduced by thread 0 alone, so it has to travel through shared memory: a
+    // register write is not visible to the other threads of the block.
+    __shared__ float s_max_score;
+    if (threadIdx.x == 0) s_max_score = -CUDART_INF_F;
+    __syncthreads();
 
     // pass 1: the row max
-    float max_score = -CUDART_INF_F;
     for (int j = 0; j < row.kv_len; ++j) {
         if (mask_mode_code == 1 && j > causal_limit) continue;
         const bf16 *k_row = k + (size_t)(row.kv_start + j) * num_kv_heads * HEAD_DIM_QK + (size_t)kv_head * HEAD_DIM_QK;
@@ -128,9 +132,10 @@ fmha_dense_fwd_kernel_sm89(
             acc = fmaf(load_bf16(q_row + d), load_bf16(k_row + d), acc);
         }
         const float total = block_reduce_sum(acc, smem) * softmax_scale;
-        if (threadIdx.x == 0) max_score = fmaxf(max_score, total);
-        __syncthreads();    // max_score is now identical on every thread
+        if (threadIdx.x == 0) s_max_score = fmaxf(s_max_score, total);
+        __syncthreads();    // every thread can now read the running max
     }
+    const float max_score = s_max_score;
 
     // pass 2: softmax-weighted accumulation, one output dim chunk at a time
     float sum_exp = 0.0f;

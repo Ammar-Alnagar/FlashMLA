@@ -7,6 +7,36 @@ import triton
 from flash_mla import flash_attn_varlen_func
 from kernelkit import check_is_allclose
 
+def get_free_gpu_memory():
+    try:
+        return torch.cuda.mem_get_info()[0]
+    except Exception:
+        return None
+
+
+def estimate_dense_memory_bytes(b, s_q, s_k, h, d, dv, has_bwd):
+    """Peak working set of one dense-attention testcase.
+
+    `sdpa()` above materialises the [b * h, s_q, s_k] score matrix in fp32, then the softmax result
+    in fp32 on top of it, and the backward pass keeps both alive. For the upstream 4096/8192 shapes
+    that is tens of gigabytes, which no consumer GPU has; such cases are skipped rather than
+    reported as failures.
+    """
+    scores = b * h * s_q * s_k * 4
+    qkv = b * h * (d + 2 * dv) * 2 * 4          # bf16 inputs plus their fp32 copies
+    total = scores * 2 + qkv
+    if has_bwd:
+        total += scores * 2                     # saved activations for the backward reference
+    return total
+
+
+def fits_in_gpu_memory(b, s_q, s_k, h, d, dv, has_bwd, fraction=0.5):
+    free = get_free_gpu_memory()
+    if free is None:
+        return True
+    return estimate_dense_memory_bytes(b, s_q, s_k, h, d, dv, has_bwd) <= free * fraction
+
+
 def get_window_size(causal, window):
     if window > 0:
         window_size = (window - 1, 0) if causal else (window - 1, window - 1)
@@ -171,7 +201,10 @@ if __name__ == "__main__":
     window = 0
     has_bwd = False
 
-    for (mean_sq, mean_sk) in [(4096, 4096), (8192, 8192)]:
+    # The small shapes are not in the upstream list; they are here so that the dense kernels can
+    # still be exercised on a GPU whose memory cannot hold the fp32 reference for 4096/8192.
+    skipped = 0
+    for (mean_sq, mean_sk) in [(512, 512), (1024, 1024), (4096, 4096), (8192, 8192)]:
         for varlen in [False, True]:
             for (h, h_k) in [(128, 128), (32, 4)]:
                 if h != h_k:
@@ -181,4 +214,10 @@ if __name__ == "__main__":
                 for (d, dv) in [(128, 128), (192, 128)]:
                     for causal in [False, True]:
                         skip_correctness_check = mean_sq == 8192 and mean_sk == 8192 and h == 128
+                        if not skip_correctness_check and not fits_in_gpu_memory(b, mean_sq, mean_sk, h, d, dv, has_bwd):
+                            skipped += 1
+                            print(f"skipping {b=} {mean_sq=} {mean_sk=} {h=}: not enough GPU memory for the fp32 reference")
+                            continue
                         test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, has_bwd, not skip_correctness_check)
+    if skipped:
+        print(f"{skipped} case(s) skipped: not enough GPU memory for the fp32 reference")

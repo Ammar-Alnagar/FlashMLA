@@ -15,7 +15,14 @@ def print_header(msg):
 def run_cmd(cmd, desc):
     print(f"[RUNNING] {desc}")
     print(f"Command: {cmd}")
-    res = subprocess.run(cmd, shell=True)
+    # The tests import `lib` / `kernelkit` from tests/ and `flash_mla` from the repo root, neither of
+    # which is importable when the script is run as `python tests/<name>.py`.
+    env = dict(os.environ)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.join(repo_root, "tests"), repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    res = subprocess.run(cmd, shell=True, env=env)
     if res.returncode != 0:
         print(f"[FAILED] {desc} (exit code: {res.returncode})")
         return False
