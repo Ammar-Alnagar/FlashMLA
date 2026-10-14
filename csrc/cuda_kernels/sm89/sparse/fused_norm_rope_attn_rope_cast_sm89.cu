@@ -144,7 +144,8 @@ __device__ __forceinline__ void load_q_tile(
         const int d = chunk * 8;
         const int h = head_base + r;
         const int p = (d % 16) + h * 16 + (d / 16) * (params.h_q * 16);
-        const bf16 *src = params.q + token_base + (size_t)p * params.stride_q_h_q + d;
+        const bf16 *src = params.q + token_base
+            + (size_t)(p / D) * params.stride_q_h_q + (p % D);
         __nv_bfloat16 *dst = q_smem + r * ROW + d;
         if (q_aligned) {
             mma::cp_async_16(dst, src, 16);
