@@ -13,11 +13,11 @@ block dim: 32，一个 warp 负责 permute q_b_proj 的一行
 grid dim: H*D
 */
 
-#include "kernel.h"
+#include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/params.h"
 
 #include <kerutils/kerutils.cuh>
 
-namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj {
+namespace flash_mla::fused_norm_rope_attn_rope_cast::permute_q_b_proj {
 
 __launch_bounds__(32)
 __global__ void permute_q_b_proj_kernel(__grid_constant__ const Params params) {

@@ -13,13 +13,31 @@ class Platform(enum.Enum):
 @functools.lru_cache(maxsize=1)
 def get_current_platform() -> Platform:
     """
-    Get the current platform via `lspci`
+    Get the current platform.
+
+    The Ascend driver exposes /dev/davinci_manager. For CUDA we would like to use lspci, but it is
+    not a reliable indicator: a laptop / hybrid-graphics machine lists its NVIDIA GPU as a
+    "VGA compatible controller" rather than a "3D controller" (and integrated graphics may come
+    first), so any single lspci string match silently reports CPU_ONLY. Ask torch instead, which
+    is what the operators actually need, and keep lspci only as a cheap fast path.
     """
     if os.path.exists("/dev/davinci_manager"):
         return Platform.ASCEND
-    output = subprocess.check_output(["lspci"], text=True)
-    if "3D controller: NVIDIA Corporation Device" in output:
-        return Platform.CUDA
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return Platform.CUDA
+    except Exception:
+        pass
+
+    try:
+        output = subprocess.check_output(["lspci"], text=True)
+        if "NVIDIA Corporation" in output:
+            return Platform.CUDA
+    except Exception:
+        pass
+
     return Platform.CPU_ONLY
 
 

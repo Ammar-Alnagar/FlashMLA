@@ -4,16 +4,23 @@
 
 #include "params.h"
 
-#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
-#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
-#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
+#include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/core_attn/params.h"
+#include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/params.h"
+#include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/params.h"
 #include "cuda_kernels/sm89/sparse/fused_norm_rope_attn_rope_cast_sm89.h"
 #include "cuda_kernels/sm89/permute/permute_q_b_proj.h"
 #include "cuda_kernels/sm89/permute/permute_wv_proj.h"
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh"
+#endif
 
-using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Prefill>;
-using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
-using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
+using Params = flash_mla::fused_norm_rope_attn_rope_cast::core_attn::ParamT<SparseAttnFwdMode::Prefill>;
+using DecodeParams = flash_mla::fused_norm_rope_attn_rope_cast::core_attn::ParamT<SparseAttnFwdMode::Decode>;
+using ParamsQBPermute = flash_mla::fused_norm_rope_attn_rope_cast::permute_q_b_proj::Params;
+using ParamsWVPermute = flash_mla::fused_norm_rope_attn_rope_cast::permute_wv_proj::Params;
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+using Config = flash_mla::fused_norm_rope_attn_rope_cast::core_attn::Config;
+#endif
 
 static at::Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const at::TensorOptions &opts, std::optional<uint32_t> extra_dim = std::nullopt) {
     // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*4))
@@ -178,13 +185,16 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
     if (arch.is_sm89()) {
         sm89::fused::run_fused_prefill_sm89(params);
-    } else {
+    }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else {
         DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
             DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+                flash_mla::fused_norm_rope_attn_rope_cast::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
             }));
         }));
     }
+#endif
 
     return {out_fp8, out_sf, max_logits, lse};
 #else
@@ -410,17 +420,20 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 
     if (arch.is_sm89()) {
         sm89::fused::run_fused_decode_sm89(params);
-    } else {
+    }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else {
         DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
             DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
                 if (extra_model_type == ModelType::V41_FP4) {
-                    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
+                    flash_mla::fused_norm_rope_attn_rope_cast::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
                 } else {
-                    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+                    flash_mla::fused_norm_rope_attn_rope_cast::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
                 }
             }));
         }));
     }
+#endif
 
     return {out_fp8, out_sf, lse};
 #else
@@ -464,7 +477,7 @@ std::vector<at::Tensor> permute_q_b_proj(
     at::Tensor scale_factors_permuted = allocate_scale_factor(h_q_d_q, q_lora_rank, gran, q_b_proj.options());
     KU_CHECK_CONTIGUOUS(q_b_proj_permuted);
 
-    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::Params params = {
+    ParamsQBPermute params = {
         (uint32_t)h_q,
         (uint32_t)d_q,
         (uint32_t)q_lora_rank,
@@ -487,9 +500,12 @@ std::vector<at::Tensor> permute_q_b_proj(
     arch.check_supported_arch();
     if (arch.is_sm89()) {
         sm89::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
-    } else {
-        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
     }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else {
+        flash_mla::fused_norm_rope_attn_rope_cast::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
+    }
+#endif
 
     return {q_b_proj_permuted, scale_factors_permuted};
 #else
@@ -533,7 +549,7 @@ std::vector<at::Tensor> permute_wv_proj(
     at::Tensor scale_factors_permuted = allocate_scale_factor(d_proj_out, wv_group_size * d_o, output_gran, wv_proj.options(), n_wv_group);
     KU_CHECK_CONTIGUOUS(wv_proj_permuted);
 
-    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::Params params = {
+    ParamsWVPermute params = {
         (uint32_t)d_o,
         (uint32_t)input_gran,
         (uint32_t)wv_group_size,
@@ -561,9 +577,12 @@ std::vector<at::Tensor> permute_wv_proj(
     arch.check_supported_arch();
     if (arch.is_sm89()) {
         sm89::permute_wv_proj::run_permute_wv_proj_kernel(params);
-    } else {
-        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
     }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else {
+        flash_mla::fused_norm_rope_attn_rope_cast::permute_wv_proj::run_permute_wv_proj_kernel(params);
+    }
+#endif
 
     return {wv_proj_permuted, scale_factors_permuted};
 #else

@@ -19,11 +19,11 @@ block dim: 32，一个 warp 负责变换 wv proj weight 的某个 wv_group 的�
 grid dim: (d_proj_out, n_wv_group)
 */
 
-#include "kernel.h"
+#include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/params.h"
 
 #include <kerutils/kerutils.cuh>
 
-namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj {
+namespace flash_mla::fused_norm_rope_attn_rope_cast::permute_wv_proj {
 
 static constexpr uint32_t INPUT_GRAN = 32;
 static constexpr uint32_t CHUNK_SIZE = 32;  // 沿着 d_o 方向，每 32 个元素为一个 chunk

@@ -1,9 +1,9 @@
 #pragma once
 
 #include "params.h"
-#include "cuda_kernels/defines.h"
+#include "cuda_kernels/common/types.h"
 
-namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj {
+namespace flash_mla::fused_norm_rope_attn_rope_cast::permute_wv_proj {
 
 struct Params {
     uint32_t d_o;           // O head dimension

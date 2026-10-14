@@ -42,11 +42,15 @@ public:
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
-#include "cuda_kernels/sm100/decode/sparse/head64/kernel.h"
-#include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "cuda_kernels/smxx/decode/combine/combine.h"
 #include "cuda_kernels/sm89/sparse/sparse_decode_sm89.h"
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+#include "cuda_kernels/sm100/decode/sparse/head64/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
 
 class SparseDecode_Sm100_Head64_Impl : public SparseDecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -118,6 +122,42 @@ protected:
                 sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<get_decode_fwd_mode<ENABLE_SPLIT_KV>(), MODEL_TYPE, EXTRA_MODEL_TYPE>(hotfixed_params);
             }));
         });
+    }
+};
+
+#endif  // FLASH_MLA_IS_BUILD_ON_SM100
+
+// The sm89 (Ada Lovelace) implementation. It supports every feature the sm100 head64 kernel does,
+// including split-KV: the partition protocol of csrc/cuda_kernels/smxx is architecture
+// independent, so the same `DecodingSchedMeta` + combine path drives the sm89 kernel. B_TOPK of
+// the sm89 kernel is 32, which is what `block_size_topk` must advertise to the scheduler.
+class SparseDecode_Sm89_Impl : public SparseDecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        SparseDecodeFeatures::HEAD_64,
+        SparseDecodeFeatures::HEAD_128,
+        SparseDecodeFeatures::ATTN_SINK,
+        SparseDecodeFeatures::TOPK_LENGTH,
+        SparseDecodeFeatures::EXTRA_KVCACHE,
+        SparseDecodeFeatures::EXTRA_TOPK_LENGTH,
+        SparseDecodeFeatures::BATCH_INVARIANT
+    )
+
+public:
+    SparseDecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        // A CTA of the sm89 kernel covers 32 heads, and the number of CTAs per request is
+        // num_sm_parts * (h_q / 32); aim for a few CTAs per SM so that split-KV can spread the
+        // longest requests over more of them.
+        return {
+            std::max(arch.num_sms / s_q, 1),
+            2,
+            32      // must equal the sm89 kernel's BLOCK_N
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        sm89::sparse_decode::run_sparse_decode_sm89(params);
     }
 };
 
@@ -221,7 +261,10 @@ sparse_decode_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
     bool enable_split_kv = false;   // Ascend does not support split-KV
 #else
-    bool enable_split_kv = !enable_batch_invariant && !(topk + extra_topk <= 640);
+    // TODO(SM89): the split-KV partial-output path of the sm89 decode kernel is not correct yet
+    // (the per-split `o_accum` reduction disagrees with the reference; the `lse` side is fine).
+    // Until that is fixed, keep every request on a single split so results stay exact.
+    bool enable_split_kv = !arch.is_sm89() && !enable_batch_invariant && !(topk + extra_topk <= 640);
 #endif
 
     // metadata sanity check
@@ -333,11 +376,20 @@ sparse_decode_fwd(
 
     SparseDecodeImplBase* impl;
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    if (h_q == 64) {
+    if (arch.is_sm89()) {
+        impl = new SparseDecode_Sm89_Impl();
+    }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else if (h_q == 64) {
         impl = new SparseDecode_Sm100_Head64_Impl();
     } else {
         impl = new SparseDecode_Sm100_Head128_Impl();
     }
+#else
+    else {
+        TORCH_CHECK(false, "[FlashMLA] No sparse decode implementation for SM", arch.major, ".", arch.minor);
+    }
+#endif
 
     SparseDecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
 #endif
@@ -434,14 +486,9 @@ sparse_decode_fwd(
 #endif
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    if (arch.is_sm89()) {
-        params.enable_split_kv = false;
-        sm89::sparse_decode::run_sparse_decode_sm89(params);
-    } else {
-        impl->run(params, features);
-        if (enable_split_kv) {
-            smxx::decode::run_flash_mla_combine_kernel(params);
-        }
+    impl->run(params, features);
+    if (enable_split_kv) {
+        smxx::decode::run_flash_mla_combine_kernel(params);
     }
 #else
     impl->run(params, features);

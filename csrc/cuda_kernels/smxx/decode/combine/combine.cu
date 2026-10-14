@@ -84,8 +84,12 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const SparseAttnDecodeParams para
     __shared__ float smem_buf[BLOCK_SIZE_M][MAX_SPLITS];
 
 
-    // Wait for the previous kernel (the MLA kernel) to finish
+    // Wait for the previous kernel (the MLA kernel) to finish. Programmatic dependent launch
+    // (griddepcontrol) only exists from sm_90 onwards; below that this is a no-op and the launch
+    // itself is a plain one, so the ordering still comes from the stream.
+#if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
+#endif
 
     // Prefetch
     static_assert(HEAD_DIM_V % (32*4) == 0);
@@ -215,19 +219,23 @@ void run_flash_mla_combine_kernel(const SparseAttnDecodeParams &params) {
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
         auto launch = [&]<bool HAVE_INCOMPLETE_HEAD_BLOCK>() {
             auto combine_kernel = &flash_fwd_mla_combine_kernel<cutlass::bfloat16_t, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, HAVE_INCOMPLETE_HEAD_BLOCK>;
-            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+            dim3 grid(params.b, params.s_q, ceil_div(params.h_q, BLOCK_SIZE_M));
+#ifdef FLASH_MLA_ENABLE_PDL
+            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch). This must only
+            // be done when the build targets sm_90+, where the producer kernel issues
+            // griddepcontrol.launch_dependents: on sm_89 the dependent grid would be allowed to
+            // start before the producer finished while having no griddepcontrol.wait to stop it.
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
             attribute[0].val.programmaticStreamSerializationAllowed = 1;
             cudaLaunchConfig_t combine_kernel_config = {
-                dim3(params.b, params.s_q, ceil_div(params.h_q, BLOCK_SIZE_M)),
-                dim3(NUM_THREADS, 1, 1),
-                0,
-                params.stream,
-                attribute,
-                1
+                grid, dim3(NUM_THREADS, 1, 1), 0, params.stream, attribute, 1
             };
             KU_CUDA_CHECK(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+#else
+            combine_kernel<<<grid, NUM_THREADS, 0, params.stream>>>(params);
+            KU_CHECK_KERNEL_LAUNCH();
+#endif
         };
         if (params.h_q % BLOCK_SIZE_M == 0) {
             launch.template operator()<false>();

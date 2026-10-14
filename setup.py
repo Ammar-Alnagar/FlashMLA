@@ -28,22 +28,29 @@ CUDA_ARCHS = ["sm_89", "sm_100a", "sm_103a"]
 # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
 HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
 
-CUDA_KERNEL_SOURCES = [
-    # sm89 kernels
+# The sm100 (Blackwell) sources use tcgen05 / TMA / cluster features that only exist from sm_100
+# onwards, and pulling in CUTLASS 4.x for them dominates the build time. They are therefore only
+# compiled when at least one Blackwell target is requested, so that a pure sm_89 (Ada) build stays
+# lean. Everything sm_89 needs is architecture-independent C++ plus the sm89 kernels.
+CUDA_KERNEL_SOURCES_SM89 = [
     "csrc/cuda_kernels/sm89/permute/permute_q_b_proj.cu",
     "csrc/cuda_kernels/sm89/permute/permute_wv_proj.cu",
     "csrc/cuda_kernels/sm89/sparse/sparse_prefill_sm89.cu",
     "csrc/cuda_kernels/sm89/sparse/sparse_decode_sm89.cu",
     "csrc/cuda_kernels/sm89/sparse/fused_norm_rope_attn_rope_cast_sm89.cu",
     "csrc/cuda_kernels/sm89/dense/dense_sm89.cu",
+]
 
-    # sm100 dense prefill (cutlass FMHA): forward and backward
-    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
+CUDA_KERNEL_SOURCES_SMXX = [
     # Small kernels for decoding: tile scheduler metadata generation and the split-KV combine
     "csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/cuda_kernels/smxx/decode/combine/combine.cu",
+]
+
+CUDA_KERNEL_SOURCES_SM100 = [
+    # sm100 dense prefill (cutlass FMHA): forward and backward
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
     # sm100 sparse prefill
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
@@ -83,7 +90,8 @@ ASCEND_KERNEL_SOURCES = [
     "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_sink.asc",
 ]
 
-def get_cuda_arch_flags():
+def resolve_cuda_archs():
+    """The list of `sm_*` targets this build targets, after applying the env overrides."""
     archs = CUDA_ARCHS
     env_archs = os.getenv("TORCH_CUDA_ARCH_LIST") or os.getenv("FLASH_MLA_CUDA_ARCHS")
     if env_archs:
@@ -97,7 +105,16 @@ def get_cuda_arch_flags():
                 arch_list.append(a_clean)
         if arch_list:
             archs = arch_list
+    return archs
 
+
+def is_sm100_arch(arch: str) -> bool:
+    """Whether `arch` is a Blackwell target, i.e. compute capability 10.x or higher."""
+    compute_arch = arch.removeprefix("sm_").rstrip("af")
+    return int(compute_arch) >= 100
+
+
+def get_cuda_arch_flags(archs):
     arch_flags = []
     for arch in archs:
         compute_arch = arch.removeprefix("sm_")
@@ -128,6 +145,21 @@ def build_on_cuda_platform():
     print(f"Compiling using NVCC {major}.{minor}")
     assert major > 13 or (major == 13 and minor >= 1), \
         "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+
+    archs = resolve_cuda_archs()
+    build_sm100 = any(is_sm100_arch(arch) for arch in archs)
+    # Programmatic dependent launch needs both producer and consumer on sm_90+ (see
+    # csrc/cuda_kernels/smxx/decode/combine/combine.cu).
+    enable_pdl = any(int(arch.removeprefix("sm_").rstrip("af")) >= 90 for arch in archs)
+    pdl_define = ["-DFLASH_MLA_ENABLE_PDL"] if enable_pdl else []
+    cuda_kernel_sources = [
+        *CUDA_KERNEL_SOURCES_SM89,
+        *CUDA_KERNEL_SOURCES_SMXX,
+        *(CUDA_KERNEL_SOURCES_SM100 if build_sm100 else []),
+    ]
+    print(f"Building for: {', '.join(archs)}")
+    print("  sm89 (Ada Lovelace) kernels: enabled")
+    print(f"  sm100/sm103 (Blackwell) kernels: {'enabled' if build_sm100 else 'disabled (set TORCH_CUDA_ARCH_LIST=8.9 for an sm89-only build)'}")
 
     class BuildExtensionWithPostActions(BuildExtension):
         """
@@ -167,7 +199,7 @@ def build_on_cuda_platform():
             name=EXT_NAME_CUDA,
             sources=[
                 *API_SOURCES,
-                *CUDA_KERNEL_SOURCES,
+                *cuda_kernel_sources,
             ],
             extra_compile_args={
                 # The host-side (`.cpp`) translation units are not compiled by nvcc, so `__CUDACC__`
@@ -179,7 +211,7 @@ def build_on_cuda_platform():
                     "-Wno-deprecated-declarations",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
                     "-DKERUTILS_IS_BUILD_ON_CUDA",
-                ],
+                ] + (["-DFLASH_MLA_IS_BUILD_ON_SM100"] if build_sm100 else []),
                 "nvcc": get_nvcc_thread_args() + [
                     "-O3",
                     "-std=c++20",
@@ -197,7 +229,7 @@ def build_on_cuda_platform():
                     "--diag-suppress=445",  # "constant "N" is not used in declaring the parameter types of function template"
                     "-DNDEBUG",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
-                ] + get_cuda_arch_flags(),
+                ] + (["-DFLASH_MLA_IS_BUILD_ON_SM100"] if build_sm100 else []) + pdl_define + get_cuda_arch_flags(archs),
             },
             include_dirs=[
                 THIS_DIR / "csrc",

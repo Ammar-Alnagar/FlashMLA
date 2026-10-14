@@ -1,174 +1,203 @@
+/*
+SM89 (Ada Lovelace) sparse attention prefill.
+
+Q is [s_q, h_q, 512] bf16, KV is [s_kv, h_kv, 512] bf16, and `indices` [s_q, h_kv, topk] int32
+lists, per query token, the KV tokens to attend to. Out is [s_q, h_q, 512] bf16, together with
+the per-head max logit and the natural-log LSE.
+
+One CTA owns BLOCK_H = 32 query heads of one query token; the head-block index varies fastest so
+that the CTAs sharing a query token - and therefore its KV - are co-scheduled and hit in L2.
+
+See ../../common/flash_attn.cuh for the tensor-core core and its shared-memory budget.
+*/
 #include "sparse_prefill_sm89.h"
+
+#include "cuda_kernels/sm89/common/flash_attn.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <kerutils/kerutils.cuh>
 #include <math_constants.h>
+#include <torch/extension.h>
 
 namespace sm89::sparse_prefill {
 
-__inline__ __device__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask /= 2) {
-        val += __shfl_xor_sync(0xffffffff, val, mask);
-    }
-    return val;
-}
+namespace {
 
-// 1 block processes (1 query token, 1 query head) using 128 threads
-__global__ void __launch_bounds__(128) sparse_prefill_kernel_sm89(const SparseAttnFwdParams params) {
-    int s_q_idx = blockIdx.x;
-    int h_q_idx = blockIdx.y;
+constexpr int D = 512;
+constexpr int BLOCK_H = 32;
+constexpr int BLOCK_N = 32;
+constexpr int NUM_WARPS = 8;
+constexpr int NUM_STAGES = 2;
 
-    if (s_q_idx >= params.s_q || h_q_idx >= params.h_q) return;
+using Core = FlashAttnCore<BLOCK_H, BLOCK_N, NUM_WARPS, D, NUM_STAGES>;
+using Dim = Core::Dim;
 
-    int tid = threadIdx.x;
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
+constexpr int NUM_THREADS = Core::NUM_THREADS;
+constexpr int ROW = Dim::ROW;
+constexpr int D_PER_WARP = Dim::D_PER_WARP;
+constexpr int CHUNKS = D / 8;      // 16-byte chunks per 512-wide row
 
-    int max_topk = params.topk;
-    if (params.topk_length != nullptr) {
-        int user_topk = params.topk_length[s_q_idx];
-        if (user_topk < max_topk) {
-            max_topk = user_topk;
-        }
-    }
+__global__ void __launch_bounds__(NUM_THREADS, 1)
+sparse_prefill_kernel_sm89(__grid_constant__ const SparseAttnFwdParams params) {
+    extern __shared__ __align__(16) char smem_raw[];
 
-    // Load Q vector [512] for (s_q_idx, h_q_idx) into registers
-    const nv_bfloat16* q_base = reinterpret_cast<const nv_bfloat16*>(params.q);
-    const nv_bfloat16* q_ptr = q_base + s_q_idx * params.stride_q_s_q + h_q_idx * params.stride_q_h_q;
+    const int warp_id = threadIdx.x / 32;
+    const int tid = threadIdx.x;
 
-    nv_bfloat16 q_reg[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int d = tid * 4 + i;
-        q_reg[i] = (d < params.d_qk) ? q_ptr[d] : __float2bfloat16(0.0f);
-    }
+    // Adjacent CTAs handle the head blocks of the same query token so that they share KV in L2.
+    const int num_head_blocks = params.h_q / BLOCK_H;
+    const int s_q_idx = blockIdx.x / num_head_blocks;
+    const int head_base = (blockIdx.x % num_head_blocks) * BLOCK_H;
 
-    const int* idx_ptr = params.indices + s_q_idx * params.stride_indices_s_q;
-    const nv_bfloat16* kv_base = reinterpret_cast<const nv_bfloat16*>(params.kv);
+    Core core;
+    core.q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    core.k_smem = core.q_smem + BLOCK_H * ROW;
+    core.valid_smem = reinterpret_cast<int*>(core.k_smem + NUM_STAGES * BLOCK_N * ROW);
+    core.init(warp_id, tid, params.sm_scale_div_log2);
 
-    float max_score = -CUDART_INF_F;
+    // A row of Q / KV is 16-byte loadable iff all the involved strides are multiples of 8 elements.
+    const bool q_aligned = ((params.stride_q_s_q | params.stride_q_h_q) & 7) == 0;
+    const bool kv_aligned = ((params.stride_kv_s_kv | params.stride_kv_h_kv) & 7) == 0;
 
-    // First pass: find max score over all valid topk
-    for (int t = 0; t < max_topk; ++t) {
-        int kv_idx = idx_ptr[t];
-        if (kv_idx >= 0 && kv_idx < params.s_kv) {
-            const nv_bfloat16* k_ptr = kv_base + kv_idx * params.stride_kv_s_kv;
-            float dot_sum = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                int d = tid * 4 + i;
-                if (d < params.d_qk) {
-                    float q_val = __bfloat162float(q_reg[i]);
-                    float k_val = __bfloat162float(k_ptr[d]);
-                    dot_sum += q_val * k_val;
-                }
-            }
-            dot_sum = warp_reduce_sum(dot_sum);
-
-            __shared__ float warp_dots[4];
-            if (lane_id == 0) {
-                warp_dots[warp_id] = dot_sum;
-            }
-            __syncthreads();
-
-            if (tid == 0) {
-                float total_dot = warp_dots[0] + warp_dots[1] + warp_dots[2] + warp_dots[3];
-                float score = total_dot * params.sm_scale;
-                if (score > max_score) {
-                    max_score = score;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    __shared__ float smem_max_score;
-    if (tid == 0) smem_max_score = max_score;
-    __syncthreads();
-    max_score = smem_max_score;
-
-    float sum_exp = 0.0f;
-    float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    if (max_score != -CUDART_INF_F) {
-        // Second pass: compute softmax & accumulate output
-        for (int t = 0; t < max_topk; ++t) {
-            int kv_idx = idx_ptr[t];
-            if (kv_idx >= 0 && kv_idx < params.s_kv) {
-                const nv_bfloat16* k_ptr = kv_base + kv_idx * params.stride_kv_s_kv;
-                float dot_sum = 0.0f;
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    int d = tid * 4 + i;
-                    if (d < params.d_qk) {
-                        float q_val = __bfloat162float(q_reg[i]);
-                        float k_val = __bfloat162float(k_ptr[d]);
-                        dot_sum += q_val * k_val;
-                    }
-                }
-                dot_sum = warp_reduce_sum(dot_sum);
-
-                __shared__ float warp_dots[4];
-                if (lane_id == 0) warp_dots[warp_id] = dot_sum;
-                __syncthreads();
-
-                float score = (warp_dots[0] + warp_dots[1] + warp_dots[2] + warp_dots[3]) * params.sm_scale;
-                float weight = expf(score - max_score);
-                sum_exp += weight;
-
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    int d = tid * 4 + i;
-                    if (d < params.d_v) {
-                        float v_val = __bfloat162float(k_ptr[d]);
-                        o_acc[i] += weight * v_val;
-                    }
-                }
-                __syncthreads();
-            }
-        }
-    }
-
-    // Write outputs
-    int out_idx = s_q_idx * params.h_q + h_q_idx;
-    if (tid == 0) {
-        if (max_score == -CUDART_INF_F || sum_exp == 0.0f) {
-            params.max_logits[out_idx] = -CUDART_INF_F;
-            params.lse[out_idx] = CUDART_INF_F;
+    for (int c = tid; c < BLOCK_H * CHUNKS; c += NUM_THREADS) {
+        const int r = c / CHUNKS;
+        const int chunk = c % CHUNKS;
+        const bf16 *src = params.q + s_q_idx * params.stride_q_s_q + (head_base + r) * params.stride_q_h_q;
+        __nv_bfloat16 *dst = core.q_smem + r * ROW + chunk * 8;
+        if (q_aligned) {
+            mma::cp_async_16(dst, src + chunk * 8, 16);
         } else {
-            params.max_logits[out_idx] = max_score;
-            params.lse[out_idx] = max_score + logf(sum_exp);
+            dst[0] = mma::load_bf16(src + chunk * 8);
+            #pragma unroll
+            for (int i = 1; i < 8; ++i) dst[i] = mma::load_bf16(src + chunk * 8 + i);
         }
     }
+    mma::cp_async_commit();
 
-    float final_scale = 0.0f;
-    if (sum_exp > 0.0f) {
-        final_scale = 1.0f / sum_exp;
-        if (params.attn_sink != nullptr) {
-            float sink_val = params.attn_sink[h_q_idx];
-            float lse_val = max_score + logf(sum_exp);
-            float sink_factor = expf(lse_val) / (expf(lse_val) + expf(sink_val));
-            final_scale *= sink_factor;
-        }
+    int topk_eff = params.topk;
+    if (params.topk_length != nullptr) {
+        const int user_topk = params.topk_length[s_q_idx];
+        if (user_topk < topk_eff) topk_eff = user_topk;
     }
+    const int num_key_tiles = (topk_eff + BLOCK_N - 1) / BLOCK_N;
+    const int *idx_ptr = params.indices + s_q_idx * params.stride_indices_s_q;
 
-    nv_bfloat16* out_base = reinterpret_cast<nv_bfloat16*>(params.out);
-    nv_bfloat16* out_ptr = out_base + s_q_idx * (params.h_q * params.d_v) + h_q_idx * params.d_v;
+    auto load_k_tile = [&](int stage, int tile_idx) {
+        __nv_bfloat16 *ks = core.k_stage(stage);
+        int *valid = core.valid_stage(stage);
+        const int base = tile_idx * BLOCK_N;
+
+        for (int c = tid; c < BLOCK_N * CHUNKS; c += NUM_THREADS) {
+            const int r = c / CHUNKS;
+            const int chunk = c % CHUNKS;
+            const int j = base + r;
+            const int kv_idx = (j < topk_eff) ? idx_ptr[j] : 0;
+            const bool ok = (j < topk_eff) && (kv_idx >= 0) && (kv_idx < params.s_kv);
+            // A masked-out row must still be handed a dereferenceable source address even when
+            // cp.async is asked to transfer zero bytes.
+            const bf16 *src = params.kv + (ok ? kv_idx : 0) * params.stride_kv_s_kv;
+            __nv_bfloat16 *dst = ks + r * ROW + chunk * 8;
+            if (kv_aligned) {
+                mma::cp_async_16(dst, src + chunk * 8, ok ? 16 : 0);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) dst[i] = mma::load_bf16(src + chunk * 8 + i);
+            }
+        }
+
+        for (int r = tid; r < BLOCK_N; r += NUM_THREADS) {
+            const int j = base + r;
+            const int kv_idx = (j < topk_eff) ? idx_ptr[j] : 0;
+            valid[r] = (j < topk_eff && kv_idx >= 0 && kv_idx < params.s_kv) ? 1 : 0;
+        }
+    };
+
+    core.run(num_key_tiles, load_k_tile);
+
+    // ---- epilogue ----
+    // Each warp owns 16 heads x D_PER_WARP dims of O. Stage the normalised bf16 result in the
+    // (now dead) Q tile so that the global stores are 16-byte and fully coalesced.
+    const int q_head = head_base + core.m_tile * 16 + core.lane_id / 4;
+    const float sink2_lo = params.attn_sink == nullptr ? -CUDART_INF_F
+        : params.attn_sink[q_head] * CUDART_L2E_F;
+    const float sink2_hi = params.attn_sink == nullptr ? -CUDART_INF_F
+        : params.attn_sink[q_head + 8] * CUDART_L2E_F;
 
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int d = tid * 4 + i;
-        if (d < params.d_v) {
-            out_ptr[d] = __float2bfloat16(o_acc[i] * final_scale);
+    for (int j = 0; j < Core::D_TILES; ++j) {
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int half = e >> 1;
+            const int row = (half == 0) ? core.lane_id / 4 : core.lane_id / 4 + 8;
+            const int d = core.d_tile * D_PER_WARP + j * 8 + (core.lane_id & 3) * 2 + (e & 1);
+            const float sum = core.row_sum[half];
+            float val = 0.0f;
+            if (sum > 0.0f) {
+                const float lse2 = core.row_max[half] + __log2f(sum);
+                const float sink2 = (half == 0) ? sink2_lo : sink2_hi;
+                // attn_sink adds exp(sink) to the softmax denominator but contributes no value
+                val = core.o[j][e] / (sum * (1.0f + exp2f(sink2 - lse2)));
+            }
+            core.q_smem[(core.m_tile * 16 + row) * ROW + d] = __float2bfloat16(val);
+        }
+    }
+    __syncthreads();
+
+    for (int c = tid; c < BLOCK_H * CHUNKS; c += NUM_THREADS) {
+        const int r = c / CHUNKS;
+        const int chunk = c % CHUNKS;
+        bf16 *dst = params.out + s_q_idx * params.h_q * D + (head_base + r) * D + chunk * 8;
+        uint4 v = mma::ld_shared_u128(core.q_smem + r * ROW + chunk * 8);
+        *reinterpret_cast<uint4*>(dst) = v;
+    }
+
+    // max_logits / lse (natural log). Only the lanes that own a row write them.
+    if (core.lane_id % 4 == 0) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int row = core.lane_id / 4 + half * 8;
+            const int global_index = s_q_idx * params.h_q + head_base + core.m_tile * 16 + row;
+            const float m = core.row_max[half];
+            const float sum = core.row_sum[half];
+            if (m == -CUDART_INF_F || sum == 0.0f) {
+                params.max_logits[global_index] = -CUDART_INF_F;
+                params.lse[global_index] = CUDART_INF_F;
+            } else {
+                params.max_logits[global_index] = m * CUDART_LN2_F;
+                params.lse[global_index] = (m + __log2f(sum)) * CUDART_LN2_F;
+            }
         }
     }
 }
+
+}  // namespace
 
 void run_sparse_prefill_sm89(const SparseAttnFwdParams &params) {
-    dim3 grid(params.s_q, params.h_q);
-    dim3 block(128);
-    sparse_prefill_kernel_sm89<<<grid, block, 0, params.stream>>>(params);
+    TORCH_CHECK(params.h_q % BLOCK_H == 0,
+        "[FlashMLA] SM89 sparse prefill requires h_q to be a multiple of ", BLOCK_H, ", got ", params.h_q);
+    TORCH_CHECK(params.d_qk == D && params.d_v == D,
+        "[FlashMLA] SM89 sparse prefill requires d_qk == d_v == 512, got ", params.d_qk, " and ", params.d_v);
+
+    constexpr size_t smem_bytes =
+        (size_t)(BLOCK_H + NUM_STAGES * BLOCK_N) * ROW * sizeof(__nv_bfloat16)
+        + (size_t)NUM_STAGES * BLOCK_N * sizeof(int);
+
+    // sm_89 allows up to 101376 bytes of dynamic shared memory per block
+    TORCH_CHECK(smem_bytes <= 101376, "[FlashMLA] SM89 sparse prefill needs ", smem_bytes,
+        " bytes of shared memory, more than sm_89 provides");
+
+    static const bool configured = [&] {
+        KU_CUDA_CHECK(cudaFuncSetAttribute(
+            sparse_prefill_kernel_sm89, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+        return true;
+    }();
+    (void)configured;
+
+    const int num_head_blocks = params.h_q / BLOCK_H;
+    const unsigned grid = (unsigned)params.s_q * (unsigned)num_head_blocks;
+    sparse_prefill_kernel_sm89<<<grid, NUM_THREADS, smem_bytes, params.stream>>>(params);
+    KU_CHECK_KERNEL_LAUNCH();
 }
 
 }  // namespace sm89::sparse_prefill

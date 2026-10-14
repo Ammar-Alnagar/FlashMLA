@@ -16,10 +16,14 @@ class SparseFwdImplBase : public ImplBase<
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
+#include "cuda_kernels/sm89/sparse/sparse_prefill_sm89.h"
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
-#include "cuda_kernels/sm89/sparse/sparse_prefill_sm89.h"
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
 
 class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -59,6 +63,8 @@ protected:
         sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41>(params);
     }
 };
+
+#endif  // FLASH_MLA_IS_BUILD_ON_SM100
 
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 
@@ -199,7 +205,9 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     if (arch.is_sm89()) {
         sm89::sparse_prefill::run_sparse_prefill_sm89(params);
-    } else if (arch.is_sm100f()) {
+    }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else if (arch.is_sm100f()) {
         if (h_q == 64) {
             SparseFwd_Sm100_Head64_Impl fwd_impl;
             fwd_impl.run(params, required_features);
@@ -219,6 +227,10 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
                 regular_impl.run(params, required_features);
             }
         }
+    }
+#endif
+    else {
+        TORCH_CHECK(false, "[FlashMLA] No sparse prefill implementation for SM", arch.major, ".", arch.minor);
     }
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 

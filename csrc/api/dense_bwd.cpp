@@ -1,7 +1,9 @@
 #include "common.h"
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
 #include "cuda_kernels/sm100/prefill/dense/interface.h"
+#endif
 #include "cuda_kernels/sm89/dense/dense_sm89.h"
 
 static void dense_prefill_bwd(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
@@ -17,13 +19,16 @@ static void dense_prefill_bwd(at::Tensor workspace_buffer, at::Tensor d_o, at::T
             cumulative_seqlen_q, cumulative_seqlen_kv, dq, dk, dv,
             mask_mode_code, softmax_scale, max_seqlen_q, max_seqlen_kv, is_varlen
         );
-    } else {
+    }
+#ifdef FLASH_MLA_IS_BUILD_ON_SM100
+    else {
         FMHACutlassSM100BwdRun(
             workspace_buffer, d_o, q, k, v, o, lse,
             cumulative_seqlen_q, cumulative_seqlen_kv, dq, dk, dv,
             mask_mode_code, softmax_scale, max_seqlen_q, max_seqlen_kv, is_varlen
         );
     }
+#endif
 }
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 

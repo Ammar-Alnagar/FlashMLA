@@ -6,8 +6,14 @@ import functools
 import argparse
 import torch
 import tile_kernels
-import deep_gemm
 import kernelkit as kk
+
+try:
+    import deep_gemm
+except ImportError:
+    # DeepGEMM needs Hopper/Blackwell (TMA + warp-specialised WGMMA), so it is not installable on
+    # SM89. `deep_gemm_fallback` reimplements the few entry points this test uses with plain torch.
+    import deep_gemm_fallback as deep_gemm
 
 from lib import TestParam, Testcase, RawTestParamForDecode, TestcaseForDecode
 import lib
@@ -161,6 +167,30 @@ default_device = torch.device("cuda:0") if kk.get_current_platform() == kk.Platf
 max_token_position = 131072
 cos_sin_cache = build_cos_sin_cache(max_token_position, default_device)
 rms_norm_eps = 1e-4
+
+# The upstream test list is sized for a data-centre GPU, but the fp32 references in `ref.py` gather
+# the whole KV cache and the attention weights at once, and the q_b_proj weight (plus its permuted
+# copy) is resident for the whole run. On a small card those cases cannot run at all, so they are
+# skipped rather than reported as failures.
+MAX_Q_LORA_RANK = 1536
+
+def estimate_fused_memory_bytes(t: TestParam) -> int:
+    if t.decode is not None:
+        topk = t.topk + (t.decode.extra_topk or 0)
+        b, s_q, h_q, d_qk = t.decode.b, t.s_q, t.h_q, t.d_qk
+        kv = max(t.s_kv, t.decode.extra_s_k or 0)
+    else:
+        topk, b, s_q, h_q, d_qk = t.topk, 1, t.s_q, t.h_q, t.d_qk
+        kv = t.s_kv
+    gathered = b * s_q * topk * d_qk          # gathered KV: bf16 temp + fp32
+    weights = b * s_q * h_q * topk            # attention weights + their masks
+    out = b * s_q * h_q * d_qk                # fp32 out + bf16 out
+    proj = h_q * d_qk * MAX_Q_LORA_RANK * 2 * 2   # q_b_proj weight + its permuted copy
+    return gathered * 4 * 2 + weights * 4 * 2 + out * 4 * 2 + kv * 2 + proj
+
+def fits_in_gpu_memory(t: TestParam, fraction: float = 0.5) -> bool:
+    free = lib.get_free_gpu_memory()
+    return True if free is None else estimate_fused_memory_bytes(t) <= free * fraction
 
 @functools.lru_cache(maxsize=None)  # To avoid generating q weight and permuted q weight for multiple times, we cache previously generated q_weight and use them later
 def get_q_b_weight(h_q: int, d_q: int, q_lora_rank: int, scale_gran: int):
@@ -517,15 +547,22 @@ if __name__ == '__main__':
     print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases to run{kk.colors['CLEAR']}")
 
     failed_cases = []
+    skipped_cases = 0
     for test_idx, test in enumerate(testcases):
         if test != testcases[0] and test.num_runs > 0 and not args.no_cooldown:
             time.sleep(0.3)
+        if not fits_in_gpu_memory(test):
+            skipped_cases += 1
+            continue
         print(f'[{test_idx:5d}/{len(testcases):5d} ({test_idx/len(testcases)*100:5.1f}%)] ', end='')
         is_correct = run_test(test) if test.decode is None else run_decode_test(test)
         if not is_correct:
             failed_cases.append(test)
             if not args.run_to_finish:
                 sys.exit(1)
+
+    if skipped_cases > 0:
+        print(f"{kk.colors['YELLOW']}{skipped_cases} / {len(testcases)} cases skipped: not enough GPU memory for the reference{kk.colors['CLEAR']}")
     
     total = len(testcases)
     if len(failed_cases) > 0:

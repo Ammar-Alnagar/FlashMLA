@@ -23,8 +23,16 @@ I/O: See GetDecodeSchedMetaParams in csrc/params.h
 
 namespace smxx::decode {
 
+// The third `__launch_bounds__` argument is maxBlocksPerCluster, which only exists for
+// cluster-capable targets (sm_90/sm_100); sm_89 rejects it.
+#ifdef KERUTILS_ENABLE_SM100A
+#define GET_MLA_META_LAUNCH_BOUNDS __launch_bounds__(32, 1, 1)
+#else
+#define GET_MLA_META_LAUNCH_BOUNDS __launch_bounds__(32, 1)
+#endif
+
 template<bool HAVE_TOPK_LEN, bool HAVE_EXTRA_TOPK, bool HAVE_EXTRA_TOPK_LEN>
-__global__ void __launch_bounds__(32, 1, 1)
+__global__ void GET_MLA_META_LAUNCH_BOUNDS
 get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
     DecodingSchedMeta *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
     int *num_splits_ptr = params.num_splits_ptr;

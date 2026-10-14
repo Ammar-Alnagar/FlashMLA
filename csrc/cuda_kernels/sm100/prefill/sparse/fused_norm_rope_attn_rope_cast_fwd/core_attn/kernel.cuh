@@ -12,7 +12,7 @@
 
 #include "config.h"
 
-namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn {
+namespace flash_mla::fused_norm_rope_attn_rope_cast::core_attn {
 
 static constexpr float MAX_INIT_VAL = -1e30;
 static constexpr float O_QUANT_CLAMP_MIN_VALUE = 1e-4;
