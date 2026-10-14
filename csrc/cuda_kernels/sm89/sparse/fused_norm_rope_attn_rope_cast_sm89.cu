@@ -86,9 +86,14 @@ __device__ __forceinline__ uint8_t quant_ue8m0_exponent(float abs_max) {
 
 // Optional RMSNorm over all 512 dims of each of the CTA's heads, followed by the non-neox RoPE on
 // the last `rope_dim` dims. Operates in place on the Q tile that the core streams over.
+//
+// The norm is *not* folded into the Q tile: the sm100 kernel multiplies the fp32 scores by the norm
+// denominator instead (`score_multiplier`), and doing the same here keeps the Q tile exactly as
+// precise as the reference. `inv_out[r]` receives that denominator for head `head_base + r`.
 template<typename ParamT>
 __device__ __forceinline__ void preprocess_q(
-    const ParamT &params, __nv_bfloat16 *q_smem, int token_position, int rope_dim, int tid
+    const ParamT &params, __nv_bfloat16 *q_smem, float *inv_out,
+    int token_position, int rope_dim, int tid
 ) {
     if (params.enable_q_norm) {
         __shared__ float red[NUM_WARPS];
@@ -105,11 +110,11 @@ __device__ __forceinline__ void preprocess_q(
             #pragma unroll
             for (int w = 0; w < NUM_WARPS; ++w) total += red[w];
             const float inv = rsqrtf(total / (float)D + params.rms_norm_eps);
-            for (int c = tid; c < D; c += NUM_THREADS) {
-                q_smem[r * ROW + c] = __float2bfloat16(__bfloat162float(q_smem[r * ROW + c]) * inv);
-            }
+            if (tid == 0) inv_out[r] = inv;   // every thread computed the same `inv`
             __syncthreads();
         }
+    } else {
+        for (int r = tid; r < BLOCK_H; r += NUM_THREADS) inv_out[r] = 1.0f;
     }
 
     const float *cos_sin = params.cos_sin_cache + (size_t)token_position * rope_dim;
@@ -300,12 +305,15 @@ fused_prefill_kernel_sm89(__grid_constant__ const PrefillParams params) {
     core.k_smem = core.q_smem + BLOCK_H * ROW;
     core.valid_smem = reinterpret_cast<int*>(core.k_smem + NUM_STAGES * BLOCK_N * ROW);
     core.init(warp_id, tid, params.sm_scale_div_log2);
+    __shared__ float q_norm_inv[BLOCK_H];
 
     load_q_tile(params, core.q_smem, s_q_idx * params.stride_q_s_q, head_base, tid);
     mma::cp_async_wait_all();
     __syncthreads();
 
-    preprocess_q(params, core.q_smem, __ldg(params.token_positions + s_q_idx), params.rope_dim, tid);
+    preprocess_q(params, core.q_smem, q_norm_inv, __ldg(params.token_positions + s_q_idx), params.rope_dim, tid);
+    core.row_scale[0] = q_norm_inv[core.m_tile * 16 + core.lane_id / 4];
+    core.row_scale[1] = q_norm_inv[core.m_tile * 16 + core.lane_id / 4 + 8];
 
     int topk_eff = params.topk;
     if (params.topk_length != nullptr) {
@@ -367,12 +375,15 @@ fused_decode_kernel_sm89(__grid_constant__ const DecodeParams params) {
     core.k_smem = core.q_smem + BLOCK_H * ROW;
     core.valid_smem = reinterpret_cast<int*>(core.k_smem + NUM_STAGES * BLOCK_N * ROW);
     core.init(warp_id, tid, params.sm_scale_div_log2);
+    __shared__ float q_norm_inv[BLOCK_H];
 
     load_q_tile(params, core.q_smem, s_q_idx * params.stride_q_s_q, head_base, tid);
     mma::cp_async_wait_all();
     __syncthreads();
 
-    preprocess_q(params, core.q_smem, __ldg(params.token_positions + s_q_idx), params.rope_dim, tid);
+    preprocess_q(params, core.q_smem, q_norm_inv, __ldg(params.token_positions + s_q_idx), params.rope_dim, tid);
+    core.row_scale[0] = q_norm_inv[core.m_tile * 16 + core.lane_id / 4];
+    core.row_scale[1] = q_norm_inv[core.m_tile * 16 + core.lane_id / 4 + 8];
 
     const int topk_length = params.topk_length ? __ldg(params.topk_length) : params.topk;
     const int extra_topk_length = params.extra_topk_length ? __ldg(params.extra_topk_length) : params.extra_topk;

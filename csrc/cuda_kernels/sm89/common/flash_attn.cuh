@@ -85,6 +85,11 @@ struct FlashAttnCore {
     float o[D_TILES][4];
     float row_max[2];
     float row_sum[2];
+    // Optional per-row multiplier on the raw QK scores, applied in fp32 alongside sm_scale. Used by
+    // the fused kernel to fold in an RMS norm over Q: scaling the bf16 Q tile instead would round
+    // the normalised values back to bf16 and lose the precision. Both default to 1.0f, which makes
+    // the multiply below exact.
+    float row_scale[2];
 
     __device__ __forceinline__ void reset() {
         #pragma unroll
@@ -93,6 +98,7 @@ struct FlashAttnCore {
         }
         row_max[0] = -CUDART_INF_F; row_max[1] = -CUDART_INF_F;
         row_sum[0] = 0.0f;         row_sum[1] = 0.0f;
+        row_scale[0] = 1.0f;       row_scale[1] = 1.0f;
     }
 
     __device__ __forceinline__ void init(int warp_id_, int tid_, float scale) {
@@ -194,10 +200,10 @@ struct FlashAttnCore {
 
         #pragma unroll
         for (int n = 0; n < N_TILES; ++n) {
-            acc[n][0] *= sm_scale_div_log2;
-            acc[n][1] *= sm_scale_div_log2;
-            acc[n][2] *= sm_scale_div_log2;
-            acc[n][3] *= sm_scale_div_log2;
+            acc[n][0] *= sm_scale_div_log2 * row_scale[0];
+            acc[n][1] *= sm_scale_div_log2 * row_scale[0];
+            acc[n][2] *= sm_scale_div_log2 * row_scale[1];
+            acc[n][3] *= sm_scale_div_log2 * row_scale[1];
         }
 
         // ---- online softmax ----
