@@ -562,7 +562,7 @@ if __name__ == '__main__':
                 sys.exit(1)
 
     if skipped_cases > 0:
-        print(f"{kk.colors['YELLOW']}{skipped_cases} / {len(testcases)} cases skipped: not enough GPU memory for the reference{kk.colors['CLEAR']}")
+        print(f"{kk.colors['YELLOW_FG']}{skipped_cases} / {len(testcases)} cases skipped: not enough GPU memory for the reference{kk.colors['CLEAR']}")
     
     total = len(testcases)
     if len(failed_cases) > 0:

@@ -128,13 +128,30 @@ __device__ __forceinline__ void preprocess_q(
 
 // ---- Q load -----------------------------------------------------------------------------
 
+// `q` is the result of the q_b_proj GEMM run over the *permuted* weight, so its rows follow the
+// layout that `permute_q_b_proj` produces: permuted row p holds the (head, dim) pair
+//     p = d % 16 + h * 16 + (d / 16) * (h_q * 16),
+// i.e. each run of 16 consecutive rows is one head's 16 dim-chunks. The attention core below wants
+// q_smem row r to be head `head_base + r` with column c = dim c, so the permutation is undone here.
 template<typename ParamT>
-__device__ __forceinline__ void load_q_tile(const ParamT &params, __nv_bfloat16 *q_smem, int row_base, int tid) {
+__device__ __forceinline__ void load_q_tile(
+    const ParamT &params, __nv_bfloat16 *q_smem, int token_base, int head_base, int tid
+) {
+    const bool q_aligned = (params.stride_q_h_q & 7) == 0;
     for (int c = tid; c < BLOCK_H * CHUNKS; c += NUM_THREADS) {
         const int r = c / CHUNKS;
         const int chunk = c % CHUNKS;
-        const bf16 *src = params.q + row_base + (size_t)(r) * params.stride_q_h_q + chunk * 8;
-        mma::cp_async_16(q_smem + r * ROW + chunk * 8, src, 16);
+        const int d = chunk * 8;
+        const int h = head_base + r;
+        const int p = (d % 16) + h * 16 + (d / 16) * (params.h_q * 16);
+        const bf16 *src = params.q + token_base + (size_t)p * params.stride_q_h_q + d;
+        __nv_bfloat16 *dst = q_smem + r * ROW + d;
+        if (q_aligned) {
+            mma::cp_async_16(dst, src, 16);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) dst[i] = mma::load_bf16(src + i);
+        }
     }
     mma::cp_async_commit();
 }
@@ -283,8 +300,7 @@ fused_prefill_kernel_sm89(__grid_constant__ const PrefillParams params) {
     core.valid_smem = reinterpret_cast<int*>(core.k_smem + NUM_STAGES * BLOCK_N * ROW);
     core.init(warp_id, tid, params.sm_scale_div_log2);
 
-    load_q_tile(params, core.q_smem,
-        (size_t)s_q_idx * params.stride_q_s_q + (size_t)head_base * params.stride_q_h_q, tid);
+    load_q_tile(params, core.q_smem, s_q_idx * params.stride_q_s_q, head_base, tid);
     mma::cp_async_wait_all();
     __syncthreads();
 
@@ -351,8 +367,7 @@ fused_decode_kernel_sm89(__grid_constant__ const DecodeParams params) {
     core.valid_smem = reinterpret_cast<int*>(core.k_smem + NUM_STAGES * BLOCK_N * ROW);
     core.init(warp_id, tid, params.sm_scale_div_log2);
 
-    load_q_tile(params, core.q_smem,
-        (size_t)s_q_idx * params.stride_q_s_q + (size_t)head_base * params.stride_q_h_q, tid);
+    load_q_tile(params, core.q_smem, s_q_idx * params.stride_q_s_q, head_base, tid);
     mma::cp_async_wait_all();
     __syncthreads();
 
