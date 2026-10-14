@@ -19,6 +19,7 @@ class SparseFwdImplBase : public ImplBase<
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#include "cuda_kernels/sm89/sparse/sparse_prefill_sm89.h"
 
 class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -101,7 +102,7 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
-    TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Prefill Kernel (sparse_prefill_fwd) is only supported on SM100f architectures.");
+    arch.check_supported_arch();
 #endif
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -196,23 +197,27 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
     }
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    if (h_q == 64) {
-        SparseFwd_Sm100_Head64_Impl fwd_impl;
-        fwd_impl.run(params, required_features);
-    } else {
-        SparseFwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-        SparseFwd_Sm100_Head128_Impl regular_impl;
-        bool use_small_topk_impl = false;
-        if (
-            (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-            !regular_impl.check_if_all_features_are_supported(required_features)
-        ) {
-            use_small_topk_impl = true;
-        }
-        if (use_small_topk_impl) {
-            small_topk_impl.run(params, required_features);
+    if (arch.is_sm89()) {
+        sm89::sparse_prefill::run_sparse_prefill_sm89(params);
+    } else if (arch.is_sm100f()) {
+        if (h_q == 64) {
+            SparseFwd_Sm100_Head64_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
         } else {
-            regular_impl.run(params, required_features);
+            SparseFwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
+            SparseFwd_Sm100_Head128_Impl regular_impl;
+            bool use_small_topk_impl = false;
+            if (
+                (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
+                !regular_impl.check_if_all_features_are_supported(required_features)
+            ) {
+                use_small_topk_impl = true;
+            }
+            if (use_small_topk_impl) {
+                small_topk_impl.run(params, required_features);
+            } else {
+                regular_impl.run(params, required_features);
+            }
         }
     }
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA

@@ -54,6 +54,23 @@ struct Arch {
     bool is_sm100f() const {
         return major == 10;
     }
+
+    bool is_sm89() const {
+        return major == 8 && minor == 9;
+    }
+
+    bool is_sm80() const {
+        return major == 8 && minor < 9;
+    }
+
+    void check_supported_arch() const {
+        if (is_sm80()) {
+            TORCH_CHECK(false, "[FlashMLA] SM80 / SM86 (Ampere) is not supported. FlashMLA requires NVIDIA SM89 (Ada Lovelace) or SM100+ (Blackwell) GPUs.");
+        }
+        if (!is_sm100f() && !is_sm89()) {
+            TORCH_CHECK(false, "[FlashMLA] Unsupported GPU architecture: SM ", major, ".", minor, ". FlashMLA supports SM89 (Ada Lovelace) and SM100+ (Blackwell) GPUs.");
+        }
+    }
 };
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 

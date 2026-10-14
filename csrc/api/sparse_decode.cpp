@@ -46,6 +46,7 @@ public:
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "cuda_kernels/smxx/decode/combine/combine.h"
+#include "cuda_kernels/sm89/sparse/sparse_decode_sm89.h"
 
 class SparseDecode_Sm100_Head64_Impl : public SparseDecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -187,7 +188,7 @@ sparse_decode_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
     Arch arch = Arch();
-    TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Decode Kernel (sparse_decode_fwd) is only supported on SM100f architectures.");
+    arch.check_supported_arch();
 #endif
     KU_CHECK_NDIM(q, 4);
     KU_CHECK_NDIM(kv, 4);
@@ -432,12 +433,19 @@ sparse_decode_fwd(
     }
 #endif
 
-    impl->run(params, features);
-    if (enable_split_kv) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-        smxx::decode::run_flash_mla_combine_kernel(params);
-#endif
+    if (arch.is_sm89()) {
+        params.enable_split_kv = false;
+        sm89::sparse_decode::run_sparse_decode_sm89(params);
+    } else {
+        impl->run(params, features);
+        if (enable_split_kv) {
+            smxx::decode::run_flash_mla_combine_kernel(params);
+        }
     }
+#else
+    impl->run(params, features);
+#endif
 
     delete impl;
 

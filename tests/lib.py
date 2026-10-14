@@ -84,8 +84,8 @@ class TestParam:
                 raise RuntimeError(f"Unknown test_target: {test_target}")
         elif kk.is_on_cuda_platform():
             cc_major, cc_minor = get_current_compute_capability()
-            if cc_major != 10:
-                return False    # Only sm100a / sm103a is supported
+            if not ((cc_major == 8 and cc_minor == 9) or cc_major == 10):
+                return False    # Supported on SM89 and SM100+
             if self.h_q not in (64, 128) or self.d_qk != 512:
                 return False
 

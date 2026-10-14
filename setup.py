@@ -21,15 +21,22 @@ API_SOURCES = [
 EXT_NAME_CUDA = "flash_mla.cuda"
 EXT_NAME_ASCEND = "flash_mla.npu"
 
-# `-gencode` targets. We use the architecture-specific ones (sm_100a / sm_103a) instead of the
-# family-specific one (sm_100f) because the kernels use `cvt` with `.scaled::n2::ue8m0`, and
-# sm_103a additionally enables better code generation for `exp`.
-CUDA_ARCHS = ["sm_100a", "sm_103a"]
+# `-gencode` targets. Includes sm_89 (Ada Lovelace) and sm_100a / sm_103a (Blackwell).
+# Can be overridden via TORCH_CUDA_ARCH_LIST or FLASH_MLA_CUDA_ARCHS environment variables.
+CUDA_ARCHS = ["sm_89", "sm_100a", "sm_103a"]
 
 # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
 HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
 
 CUDA_KERNEL_SOURCES = [
+    # sm89 kernels
+    "csrc/cuda_kernels/sm89/permute/permute_q_b_proj.cu",
+    "csrc/cuda_kernels/sm89/permute/permute_wv_proj.cu",
+    "csrc/cuda_kernels/sm89/sparse/sparse_prefill_sm89.cu",
+    "csrc/cuda_kernels/sm89/sparse/sparse_decode_sm89.cu",
+    "csrc/cuda_kernels/sm89/sparse/fused_norm_rope_attn_rope_cast_sm89.cu",
+    "csrc/cuda_kernels/sm89/dense/dense_sm89.cu",
+
     # sm100 dense prefill (cutlass FMHA): forward and backward
     "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
     "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
@@ -77,8 +84,22 @@ ASCEND_KERNEL_SOURCES = [
 ]
 
 def get_cuda_arch_flags():
+    archs = CUDA_ARCHS
+    env_archs = os.getenv("TORCH_CUDA_ARCH_LIST") or os.getenv("FLASH_MLA_CUDA_ARCHS")
+    if env_archs:
+        # e.g., "8.9" or "8.9 10.0"
+        arch_list = []
+        for a in env_archs.replace(";", " ").split():
+            a_clean = a.strip().replace(".", "")
+            if a_clean:
+                if not a_clean.startswith("sm_"):
+                    a_clean = f"sm_{a_clean}"
+                arch_list.append(a_clean)
+        if arch_list:
+            archs = arch_list
+
     arch_flags = []
-    for arch in CUDA_ARCHS:
+    for arch in archs:
         compute_arch = arch.removeprefix("sm_")
         arch_flags.extend(["-gencode", f"arch=compute_{compute_arch},code={arch}"])
     return arch_flags
