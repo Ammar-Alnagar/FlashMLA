@@ -76,8 +76,9 @@ This kernel currently supports CUDA only; Ascend is not supported.
 
 For the NVIDIA platform:
 
-- NVIDIA SM100 / SM103 GPU
-- CUDA 13.1 and above (CUDA 13.2 and above is recommended, since it provides the native `cvt.rn.bf16x2` conversions that the quantized decoding kernels use; on CUDA 13.1 they fall back to a slower widening through FP32)
+- NVIDIA SM89 (Ada Lovelace, e.g. RTX 4090 / L40 / L4) and SM100 / SM103 (Blackwell) GPUs.
+  > Note: SM80 (Ampere) and older GPU architectures are not supported; executing FlashMLA on SM80 will raise an explicit runtime unsupported error.
+- CUDA 13.1 and above (CUDA 13.x is supported by default)
 - PyTorch 2.0 and above
 
 For the Huawei platform:
@@ -103,6 +104,18 @@ The build target platform is detected automatically (`/dev/davinci_manager` mean
 On the Ascend platform, `ASCEND_HOME_PATH` must point to the root of the CANN installation (default: `/usr/local/Ascend/ascend-toolkit/latest`).
 
 After the CUDA extension is built, a register-spill check runs over the produced `.so`. The CUTLASS FMHA kernels are exempt, but if any kernel defined by this repository spills registers the build fails with "Register spilling detected. Build failed!"; export `FLASH_MLA_SKIP_REG_SPILL_CHECK=1` to skip the check.
+
+To target specific GPU architectures during build, set `TORCH_CUDA_ARCH_LIST` or `FLASH_MLA_CUDA_ARCHS`, e.g.:
+```bash
+TORCH_CUDA_ARCH_LIST="8.9" pip install -v . --no-build-isolation
+```
+
+### Running GPU Test Suite
+
+To run all automated GPU correctness tests and architecture checks:
+```bash
+python3 scripts/run_all_tests.py
+```
 
 ## Usage
 
