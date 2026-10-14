@@ -51,7 +51,8 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
     nv_bfloat16 q_reg[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        q_reg[i] = q_ptr[tid * 4 + i];
+        int d = tid * 4 + i;
+        q_reg[i] = (d < params.d_qk) ? q_ptr[d] : __float2bfloat16(0.0f);
     }
 
     const int* idx_ptr = params.indices + req_idx * params.stride_indices_b + s_q_idx * params.stride_indices_s_q;
@@ -71,9 +72,11 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 int dim_idx = tid * 4 + i;
-                float q_val = __bfloat162float(q_reg[i]);
-                float k_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                dot_sum += q_val * k_val;
+                if (dim_idx < params.d_qk) {
+                    float q_val = __bfloat162float(q_reg[i]);
+                    float k_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                    dot_sum += q_val * k_val;
+                }
             }
             dot_sum = warp_reduce_sum(dot_sum);
 
@@ -106,11 +109,13 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     int dim_idx = tid * 4 + i;
-                    float q_val = __bfloat162float(q_reg[i]);
-                    float k_val = (params.extra_model_type == ModelType::V41_FP4) ?
-                        dequant::dequant_v41_fp4(token_ptr, dim_idx) :
-                        dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                    dot_sum += q_val * k_val;
+                    if (dim_idx < params.d_qk) {
+                        float q_val = __bfloat162float(q_reg[i]);
+                        float k_val = (params.extra_model_type == ModelType::V41_FP4) ?
+                            dequant::dequant_v41_fp4(token_ptr, dim_idx) :
+                            dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                        dot_sum += q_val * k_val;
+                    }
                 }
                 dot_sum = warp_reduce_sum(dot_sum);
 
@@ -149,9 +154,11 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     int dim_idx = tid * 4 + i;
-                    float q_val = __bfloat162float(q_reg[i]);
-                    float k_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                    dot_sum += q_val * k_val;
+                    if (dim_idx < params.d_qk) {
+                        float q_val = __bfloat162float(q_reg[i]);
+                        float k_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                        dot_sum += q_val * k_val;
+                    }
                 }
                 dot_sum = warp_reduce_sum(dot_sum);
 
@@ -167,8 +174,10 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     int dim_idx = tid * 4 + i;
-                    float v_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                    o_acc[i] += weight * v_val;
+                    if (dim_idx < params.d_v) {
+                        float v_val = dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                        o_acc[i] += weight * v_val;
+                    }
                 }
             }
         }
@@ -189,11 +198,13 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
                     #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         int dim_idx = tid * 4 + i;
-                        float q_val = __bfloat162float(q_reg[i]);
-                        float k_val = (params.extra_model_type == ModelType::V41_FP4) ?
-                            dequant::dequant_v41_fp4(token_ptr, dim_idx) :
-                            dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                        dot_sum += q_val * k_val;
+                        if (dim_idx < params.d_qk) {
+                            float q_val = __bfloat162float(q_reg[i]);
+                            float k_val = (params.extra_model_type == ModelType::V41_FP4) ?
+                                dequant::dequant_v41_fp4(token_ptr, dim_idx) :
+                                dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                            dot_sum += q_val * k_val;
+                        }
                     }
                     dot_sum = warp_reduce_sum(dot_sum);
 
@@ -209,10 +220,12 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
                     #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         int dim_idx = tid * 4 + i;
-                        float v_val = (params.extra_model_type == ModelType::V41_FP4) ?
-                            dequant::dequant_v41_fp4(token_ptr, dim_idx) :
-                            dequant::dequant_v41_fp8(token_ptr, dim_idx);
-                        o_acc[i] += weight * v_val;
+                        if (dim_idx < params.d_v) {
+                            float v_val = (params.extra_model_type == ModelType::V41_FP4) ?
+                                dequant::dequant_v41_fp4(token_ptr, dim_idx) :
+                                dequant::dequant_v41_fp8(token_ptr, dim_idx);
+                            o_acc[i] += weight * v_val;
+                        }
                     }
                 }
             }
@@ -245,7 +258,10 @@ __global__ void __launch_bounds__(128) sparse_decode_kernel_sm89(const SparseAtt
         nv_bfloat16* out_ptr = out_base + req_idx * params.stride_o_b + s_q_idx * params.stride_o_s_q + h_q_idx * params.stride_o_h_q;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            out_ptr[tid * 4 + i] = __float2bfloat16(o_acc[i] * final_scale);
+            int d = tid * 4 + i;
+            if (d < params.d_v) {
+                out_ptr[d] = __float2bfloat16(o_acc[i] * final_scale);
+            }
         }
     }
 }
