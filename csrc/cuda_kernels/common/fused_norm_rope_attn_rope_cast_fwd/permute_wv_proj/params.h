@@ -1,6 +1,6 @@
 #pragma once
 
-#include "params.h"
+#include "../../../../params.h"   // csrc/params.h; a relative path because this file shadows the name
 #include "cuda_kernels/common/types.h"
 
 namespace flash_mla::fused_norm_rope_attn_rope_cast::permute_wv_proj {

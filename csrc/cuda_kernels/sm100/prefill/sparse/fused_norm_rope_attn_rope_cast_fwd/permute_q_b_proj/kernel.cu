@@ -15,9 +15,13 @@ grid dim: H*D
 
 #include "cuda_kernels/common/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/params.h"
 
+namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj {
+using flash_mla::fused_norm_rope_attn_rope_cast::permute_q_b_proj::Params;
+}  // namespace
+
 #include <kerutils/kerutils.cuh>
 
-namespace flash_mla::fused_norm_rope_attn_rope_cast::permute_q_b_proj {
+namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj {
 
 __launch_bounds__(32)
 __global__ void permute_q_b_proj_kernel(__grid_constant__ const Params params) {
