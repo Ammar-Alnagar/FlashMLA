@@ -76,7 +76,7 @@ This kernel currently supports CUDA only; Ascend is not supported.
 
 For the NVIDIA platform:
 
-- NVIDIA SM89 (Ada Lovelace, e.g. RTX 4090 / L40 / L4) and SM100 / SM103 (Blackwell) GPUs.
+- NVIDIA SM89 (Ada Lovelace, e.g., RTX 4090 / L40 / L4 / RTX 4080 / RTX 4070) and SM100 / SM103 (Blackwell) GPUs.
   > Note: SM80 (Ampere) and older GPU architectures are not supported; executing FlashMLA on SM80 will raise an explicit runtime unsupported error.
 - CUDA 13.1 and above (CUDA 13.x is supported by default)
 - PyTorch 2.0 and above
@@ -107,7 +107,11 @@ After the CUDA extension is built, a register-spill check runs over the produced
 
 To target specific GPU architectures during build, set `TORCH_CUDA_ARCH_LIST` or `FLASH_MLA_CUDA_ARCHS`, e.g.:
 ```bash
+# Build for SM89 (Ada Lovelace) only:
 TORCH_CUDA_ARCH_LIST="8.9" pip install -v . --no-build-isolation
+
+# Build for both SM89 and SM100/SM103 (default):
+pip install -v . --no-build-isolation
 ```
 
 ### Running GPU Test Suite
