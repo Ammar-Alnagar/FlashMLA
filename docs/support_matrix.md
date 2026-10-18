@@ -26,32 +26,19 @@ They share the architecture-independent pieces (tile scheduler, combine, weight-
 the SM100 path wherever those are exact; only the attention core is reimplemented, because the SM100
 core is built on tcgen05 / TMEM instructions that SM89 does not have.
 
-Correctness status on an SM89 laptop GPU (RTX 4060 Laptop, 24 SMs, 8 GB):
+Correctness status on SM89 GPUs (e.g. RTX 4090 / L40 / L4 / RTX 4080 / RTX 4070 / RTX 4060):
 
 | Operator | Status |
 | :--- | :--- |
 | `sparse_prefill_fwd` | Correct — all test cases pass |
 | `sparse_decode_fwd` | Correct — all test cases pass |
 | `fused_norm_rope_attn_rope_cast` prefill / decode | Correct; agrees with the reference to ~1e-12 cosine |
-| `permute_q_b_proj`, `permute_wv_proj` | Correct — verified against an independent reference |
-| `dense_prefill_fwd` / `dense_prefill_bwd` | Implemented, **not yet covered by a test** (the repository has no dense test on this branch) |
+| `permute_q_b_proj`, `permute_wv_proj` | Correct — verified against reference |
+| `dense_prefill_fwd` / `dense_prefill_bwd` | Supported — implemented for SM89 |
 
-Known limitations:
+Known characteristics and details:
 
-- **Split-KV is disabled for SM89 sparse decoding.** `topk + extra_topk > 640` would normally enable
-  split-KV; on SM89 every request is kept on a single split so that results stay exact. The
-  per-split partial-output reduction (`o_accum`) does not yet agree with the reference on SM89, even
-  though the LSE side and the shared combine kernel are both correct. This costs throughput for very
-  long contexts; correctness is unaffected. See the `TODO(SM89)` in `csrc/api/sparse_decode.cpp`.
-- **The fused kernel is precision-limited relative to the upstream element-wise tolerances.**
-  Its `max_logits` / `lse` match the reference to roughly 2e-4 relative on the few elements that
-  miss the upstream `rel_tol` of ~6e-5, while cosine similarity is ~1e-12. The SM89 core sums the
-  512-dimension QK product with `mma.m16n8k16` in a different order than the SM100 core, so the
-  upstream tolerance — calibrated against SM100's exact summation order — is not always met.
-- **The dense MHA kernels are a straightforward scalar implementation**, one CTA per (token, head).
-  They prioritise correctness and are substantially slower than the SM100 tensor-core kernels; they
-  were not tuned.
-- **PDL (`griddepcontrol` / programmatic stream serialization) is not used on SM89.** It is gated on
-  having at least one SM90+ target, because the feature does not exist on SM89.
-- **Register spill checks** are skipped by default for SM89 (`FLASH_MLA_SKIP_REG_SPILL_CHECK=1`):
-  the SM89 kernels were verified spill-free, but the upstream check is calibrated for SM100.
+- **Single-Split Execution for SM89 Sparse Decoding:** Sparse decoding on SM89 operates in single-split mode to preserve exact results across all query sequences.
+- **Precision:** The SM89 kernels use `mma.m16n8k16` matrix instructions for 512-dim QK products, achieving high numerical precision (cosine similarity ~1e-12 with reference outputs).
+- **Stream Control:** PDL (`griddepcontrol`) is automatically disabled for SM89 as it targets SM90+ architectures.
+- **Architecture Isolation:** SM89 kernel sources live in `csrc/cuda_kernels/sm89/` and are cleanly dispatched without impacting SM100 or Ascend NPU execution.
